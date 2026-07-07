@@ -1,0 +1,78 @@
+# =============================================================================
+# Pegasus standalone launcher configuration
+# Consumed by launch.py:  isaac_run PegasusSimulator/examples/launch.py
+# Pass a different file with:  isaac_run .../launch.py --config /path/to/other.yaml
+# =============================================================================
+
+app:
+  headless: false          # true = no GUI window (for headless SDG / servers)
+
+# --- World / environment -----------------------------------------------------
+world:
+  # Custom world USD. Absolute path, a file:// URL, or an omniverse:// URL.
+  # If null, the named `preset` below is used instead.
+  usd_path: null
+  # One of the keys in pegasus.simulator.params.SIMULATION_ENVIRONMENTS
+  # (e.g. "Curved Gridroom", "Flat Plane", "Warehouse", "Rusko Summer", ...).
+  preset: "Curved Gridroom"
+  # Add a flat invisible ground collider at z=ground_z. Needed for render-only
+  # worlds (e.g. NuRec volumes) that ship no collision mesh. false for normal USDs.
+  add_ground_plane: false
+  ground_z: 0.0
+
+# --- Vehicle -----------------------------------------------------------------
+vehicle:
+  # Custom vehicle USD (the drone model). If null, the named `preset` is used.
+  usd_path: null
+  # One of the keys in pegasus.simulator.params.ROBOTS ("Iris" or "Pegasus").
+  preset: "Iris"
+  stage_prefix: "/World/quadrotor"
+  vehicle_id: 0
+  position: [0.0, 0.0, 0.15]          # ENU, metres
+  orientation_euler_deg: [0.0, 0.0, 0.0]   # roll, pitch, yaw (XYZ)
+
+# --- Control backend ---------------------------------------------------------
+# NOTE: backend "px4" = PX4MavlinkBackend = the sim-internal MAVLink link that
+# feeds PX4 SITL sensors and reads back motor commands. This is how the drone
+# FLIES in sim; it is NOT MAVROS and must stay. ROS 2 topics come from the
+# separate uxrce_dds block below (PX4 -> Micro XRCE-DDS Agent -> /fmu/... topics).
+backend:
+  type: "px4"                # "px4" | "ros2" | "none"
+
+  px4:
+    autolaunch: true         # let Pegasus start PX4 SITL for you
+    px4_dir: null            # null -> use PegasusInterface default (configs.yaml)
+    airframe: null           # null -> use PegasusInterface default; e.g. "iris" for PX4 < v1.14
+    enable_lockstep: false   # false = PX4 free-runs on its own clock (data flows even if RTX render is slow);
+                             # true = deterministic lockstep, but stalls if sim step rate is very low
+
+  ros2:                      # used only when type == "ros2"
+    namespace: "drone"
+    pub_sensors: true
+    pub_graphical_sensors: true
+    pub_state: true
+    pub_tf: false
+    sub_control: false
+
+# --- uXRCE-DDS (PX4 <-> ROS 2 bridge, replaces MAVROS) -----------------------
+# PX4 (SITL in sim, or the real FC on hardware) runs a uxrce_dds_client that
+# streams uORB topics to a Micro XRCE-DDS Agent, which exposes them to ROS 2 as
+# /fmu/out/... and /fmu/in/... (via px4_msgs, version-matched to the firmware).
+# PX4 SITL v1.14+ auto-starts its client on UDP 8888, so in sim you only need the
+# agent running. Requires the Micro XRCE-DDS Agent installed and on PATH.
+# Launched as a child process; killed on app exit.
+uxrce_dds:
+  enabled: true
+  autostart_agent: true       # spawn MicroXRCEDDSAgent as a child process
+  transport: "udp"            # "udp" (sim / PX4 SITL) | "serial" (hardware / Jetson UART)
+  udp_port: 8888              # PX4 SITL uxrce_dds_client default; used when transport: udp
+  serial_dev: "/dev/ttyTHS1"  # Jetson UART; used when transport: serial
+  serial_baud: 921600
+  agent_binary: "/home/ubuntu/.local/bin/MicroXRCEAgent"   # source-build binary is MicroXRCEAgent (NOT ...DDSAgent)
+  # Override the whole argv (list) if your invocation differs; null = build from above.
+  command: null
+
+# --- RViz (external ROS 2 process) -------------------------------------------
+rviz:
+  enabled: false
+  config: null               # optional path to a .rviz file (rviz2 -d <config>)

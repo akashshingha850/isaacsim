@@ -1,0 +1,54 @@
+# =============================================================================
+# This git repo root IS the Isaac Sim 5.1 install directory, so by default we
+# IGNORE EVERYTHING and then explicitly re-include only our own project files
+# and the two submodules. This keeps the 100k+ Isaac-install files (exts/, kit/,
+# extscache/, docs/, standalone_examples/, the installer zip, caches, ...) out
+# of the repo. To track a new file of yours, add a matching `!/path` line below.
+# =============================================================================
+
+/*
+
+# --- git metadata ---
+!/.gitignore
+!/.gitmodules
+
+# --- submodules (tracked as gitlinks via .gitmodules) ---
+!/PegasusSimulator
+!/PX4-Autopilot
+
+# --- our launcher + config ---
+!/launch.py
+!/config.yaml
+!/config/
+
+# --- our scripts ---
+!/launch_pegasus.sh
+!/sync_submodules.sh
+!/setup_conda_env.sh
+!/setup_ros_env.sh
+!/clear_caches.sh
+!/run_tests.py
+
+# --- our env specs ---
+!/environment.yml
+!/requirements.txt
+
+# --- our project dirs ---
+!/swarm-docker/
+!/my_worlds/
+!/extension_examples
+
+# --- our edits to Isaac's Kit apps: track ONLY these two files ---
+# (must re-include the parent dir, then re-ignore its other contents)
+!/apps/
+/apps/*
+!/apps/isaacsim.exp.base.kit
+!/apps/isaacsim.exp.full.kit
+
+# --- never track scratch / logs (belt-and-suspenders; already excluded above) ---
+scratch_*
+*.log
+
+# --- large binary world assets: NuRec .usdz exports etc. exceed GitHub's 100MB ---
+# limit. Kept on disk, never tracked. Use Git LFS if you ever need them versioned.
+*.usdz
