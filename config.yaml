@@ -6,6 +6,7 @@
 
 app:
   headless: false          # true = no GUI window (for headless SDG / servers)
+  heartbeat_steps: 2000    # print a position heartbeat every N steps; 0 disables it
 
 # --- World / environment -----------------------------------------------------
 world:

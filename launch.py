@@ -260,12 +260,16 @@ class Launcher:
     # -------------------------------------------------------------------- loop
     def run(self):
         self.timeline.play()
-        print("[launch] timeline.play() called — stepping. Heartbeat every 200 steps.", flush=True)
+        hb = int(self.cfg.get("app", {}).get("heartbeat_steps", 2000))
+        if hb > 0:
+            print(f"[launch] timeline.play() called — stepping. Heartbeat every {hb} steps.", flush=True)
+        else:
+            print("[launch] timeline.play() called — stepping. Heartbeat disabled.", flush=True)
         step = 0
         while simulation_app.is_running() and not self.stop_sim:
             self.world.step(render=True)
             step += 1
-            if step % 200 == 0:
+            if hb > 0 and step % hb == 0:
                 # sim_time advancing => physics stepping; frozen => render-bound / stalled
                 t = self.world.current_time
                 pos = getattr(self.vehicle.state, "position", None)
