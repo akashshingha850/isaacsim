@@ -32,6 +32,28 @@ vehicle:
   position: [0.0, 0.0, 0.15]          # ENU, metres
   orientation_euler_deg: [0.0, 0.0, 0.0]   # roll, pitch, yaw (XYZ)
 
+# --- Chase (follow) camera ---------------------------------------------------
+# Script-driven third-person camera that tracks the vehicle every frame.
+# (Isaac's PhysX follow cameras don't update in standalone apps, so we drive it.)
+# NOTE: while active it cannot be mouse-orbited — the script overwrites its
+# transform each frame. Switch the viewport dropdown back to "Perspective"
+# whenever you want free camera control.
+chase_camera:
+  enabled: true
+  stage_path: "/World/chase_camera"
+  offset: [-10.0, 0.0, 3.0]   # body-frame FLU, metres: behind (-X) and above (+Z)
+  yaw_follow: true           # true = offset rotates with drone yaw (stays behind);
+                             # false = fixed world-frame offset (Gazebo-classic style)
+  set_active: true           # switch the viewport to this camera at startup;
+                             # false = camera exists but you pick it from the
+                             # viewport camera dropdown when wanted
+  follow_selection: true     # Gazebo-style object follow: while the viewport is on
+                             # this camera, it follows the prim selected in the GUI
+                             # (viewport or stage tree). Click empty sky / press Esc
+                             # to deselect -> falls back to following the drone.
+  smoothing: 0.15            # 0 = snap instantly; 0..0.95 = exponential glide per
+                             # frame (softens the jump when re-targeting objects)
+
 # --- Control backend ---------------------------------------------------------
 # NOTE: backend "px4" = PX4MavlinkBackend = the sim-internal MAVLink link that
 # feeds PX4 SITL sensors and reads back motor commands. This is how the drone

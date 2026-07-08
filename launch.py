@@ -47,7 +47,9 @@ simulation_app = SimulationApp({"headless": bool(CONFIG.get("app", {}).get("head
 # -----------------------------------------------------------------------------
 # 2. Everything below runs after the simulator is up.
 # -----------------------------------------------------------------------------
+import numpy as np
 import omni.timeline
+import omni.usd
 from omni.isaac.core.world import World
 from scipy.spatial.transform import Rotation
 from pxr import UsdGeom, UsdLux, Gf, UsdPhysics
@@ -143,6 +145,9 @@ class Launcher:
             config=config_multirotor,
         )
 
+        # --- Chase (follow) camera -------------------------------------------
+        self._setup_chase_camera(cfg.get("chase_camera", {}))
+
         # --- Optional external ROS 2 processes ------------------------------
         self._start_rviz(cfg.get("rviz", {}))
 
@@ -168,6 +173,105 @@ class Launcher:
         UsdGeom.Imageable(ground.GetPrim()).MakeInvisible()
         UsdLux.DomeLight.Define(stage, "/World/launch_dome_light").CreateIntensityAttr(1000.0)
         print(f"[launch] Added flat ground collider at z={ground_z}")
+
+    # ----------------------------------------------------------- chase camera
+    def _setup_chase_camera(self, chase_cfg):
+        """Third-person camera that tracks the vehicle. Isaac's PhysX follow
+        cameras don't update in a standalone SimulationApp (they're driven by
+        the GUI editor loop), so we aim a plain camera prim ourselves each frame."""
+        self.chase_camera_path = None
+        if not chase_cfg.get("enabled", False):
+            return
+        self.chase_camera_path = chase_cfg.get("stage_path", "/World/chase_camera")
+        self.chase_camera_offset = np.array(chase_cfg.get("offset", [-4.0, 0.0, 1.5]), dtype=float)
+        self.chase_camera_yaw_follow = bool(chase_cfg.get("yaw_follow", True))
+        self.chase_camera_follow_selection = bool(chase_cfg.get("follow_selection", True))
+        self.chase_camera_smoothing = min(max(float(chase_cfg.get("smoothing", 0.15)), 0.0), 0.95)
+        self._chase_eye = None
+        self._chase_target = None
+        self._chase_viewport = None
+        self._chase_last_target = None
+        UsdGeom.Camera.Define(self.world.stage, self.chase_camera_path)
+        print(f"[launch] Chase camera at {self.chase_camera_path} "
+              f"(offset={self.chase_camera_offset.tolist()}, yaw_follow={self.chase_camera_yaw_follow}, "
+              f"follow_selection={self.chase_camera_follow_selection})")
+
+        if not bool(self.cfg.get("app", {}).get("headless", False)):
+            from omni.kit.viewport.utility import get_active_viewport
+            self._chase_viewport = get_active_viewport()
+            if chase_cfg.get("set_active", True):
+                self._chase_viewport.camera_path = self.chase_camera_path
+                print("[launch] Viewport switched to the chase camera "
+                      "(pick 'Perspective' in the viewport camera dropdown for free mouse control)")
+
+    def _aim_chase_camera(self, eye, target):
+        """Place the chase-camera prim at `eye` looking at `target` (world frame, +Z up)."""
+        eye = Gf.Vec3d(float(eye[0]), float(eye[1]), float(eye[2]))
+        target = Gf.Vec3d(float(target[0]), float(target[1]), float(target[2]))
+        f = (target - eye).GetNormalized()              # forward (camera looks down -Z)
+        r = Gf.Cross(f, Gf.Vec3d(0, 0, 1)).GetNormalized()  # right
+        u = Gf.Cross(r, f)                              # up
+        # Row-vector transform: rows are the world directions of camera local X, Y, Z.
+        m = Gf.Matrix4d(
+            r[0],  r[1],  r[2],  0.0,
+            u[0],  u[1],  u[2],  0.0,
+            -f[0], -f[1], -f[2], 0.0,
+            eye[0], eye[1], eye[2], 1.0,
+        )
+        cam = UsdGeom.Xformable(self.world.stage.GetPrimAtPath(self.chase_camera_path))
+        cam.ClearXformOpOrder()
+        cam.AddTransformOp().Set(m)
+
+    def _selected_prim_pose(self):
+        """World position + yaw of the first prim selected in the GUI, or (None, None)
+        when nothing usable is selected."""
+        for path in omni.usd.get_context().get_selection().get_selected_prim_paths():
+            if path == self.chase_camera_path or path.startswith(self.chase_camera_path + "/"):
+                continue  # following itself would degenerate the look-at
+            prim = self.world.stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                continue
+            m = omni.usd.get_world_transform_matrix(prim)
+            pos = np.array(m.ExtractTranslation(), dtype=float)
+            x_axis = m.GetRow3(0)  # world direction of the prim's local X (forward)
+            yaw = float(np.arctan2(x_axis[1], x_axis[0]))
+            return pos, yaw, path
+        return None, None, "vehicle"
+
+    def _update_chase_camera(self):
+        """Keep the chase camera behind its target. The target is the prim selected
+        in the GUI (Gazebo-style object follow) while this camera drives the
+        viewport, otherwise the drone. Rotating the body-frame offset by the
+        target's yaw keeps the camera behind it; yaw-only keeps the horizon level
+        (camera doesn't flip when the drone rolls)."""
+        target_pos = target_yaw = None
+        target_label = "vehicle"
+        if (self.chase_camera_follow_selection and self._chase_viewport is not None
+                and str(self._chase_viewport.camera_path) == self.chase_camera_path):
+            target_pos, target_yaw, target_label = self._selected_prim_pose()
+        if target_pos is None:
+            target_pos = np.array(self.vehicle.state.position, dtype=float)  # ENU
+            target_yaw = Rotation.from_quat(self.vehicle.state.attitude).as_euler("xyz")[2]
+        if target_label != self._chase_last_target:
+            self._chase_last_target = target_label
+            print(f"[launch] Chase camera following: {target_label}", flush=True)
+
+        if self.chase_camera_yaw_follow:
+            world_offset = Rotation.from_euler("z", target_yaw).apply(self.chase_camera_offset)
+        else:
+            world_offset = self.chase_camera_offset
+        eye = target_pos + world_offset
+
+        if self._chase_eye is None or self.chase_camera_smoothing <= 0.0:
+            self._chase_eye, self._chase_target = eye, target_pos
+        else:
+            k = 1.0 - self.chase_camera_smoothing
+            self._chase_eye = self._chase_eye + k * (eye - self._chase_eye)
+            self._chase_target = self._chase_target + k * (target_pos - self._chase_target)
+
+        if np.linalg.norm(self._chase_target - self._chase_eye) < 1e-6:
+            return  # degenerate look-at (eye on top of target)
+        self._aim_chase_camera(self._chase_eye, self._chase_target)
 
     # ---------------------------------------------------------------- backend
     def _build_backends(self, backend_cfg, vehicle_cfg):
@@ -267,6 +371,8 @@ class Launcher:
             print("[launch] timeline.play() called — stepping. Heartbeat disabled.", flush=True)
         step = 0
         while simulation_app.is_running() and not self.stop_sim:
+            if self.chase_camera_path:
+                self._update_chase_camera()
             self.world.step(render=True)
             step += 1
             if hb > 0 and step % hb == 0:
