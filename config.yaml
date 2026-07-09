@@ -31,12 +31,53 @@ vehicle:
   # One of the keys in pegasus.simulator.params.ROBOTS ("Iris" or "Pegasus").
   preset: "Iris"
   stage_prefix: "/World/quadrotor"
-  vehicle_id: 0
+  vehicle_id: 1
   # Small Warehouse: room interior is x[-6.7,1.3] y[-7.2,9.8], ceiling 3.7 m.
   # (-5.3,-1) is the clear WEST aisle (shelving/boxes start at x=-4.6);
   # yaw 90 faces north along the aisle toward the open north zone.
-  position: [-5.3, -1.0, 0.15]        # ENU, metres
+  position: [ 0, 0, 0.15]        # ENU, metres
   orientation_euler_deg: [0.0, 0.0, 90.0]  # roll, pitch, yaw (XYZ)
+
+  # --- On-board lidar (Isaac RTX lidar) ---------------------------------------
+  # When enabled, a publish-only ROS2Backend is added automatically next to the
+  # px4 flight backend, and the point cloud appears on ROS 2 as:
+  #   /<ros2.namespace><vehicle_id>/<name>/pointcloud   (sensor_msgs/PointCloud2)
+  #   /<ros2.namespace><vehicle_id>/<name>/laserscan    (sensor_msgs/LaserScan)
+  # with frame_id = <name>. View it with rviz (block below).
+  # One mapping or a list. NOTE: /laserscan only publishes for 2D lidar configs
+  # (Isaac's flat-scan node rejects 3D ones), hence the extra 2D unit below.
+  # `outputs` picks the ROS 2 topics per lidar: "pointcloud" and/or "laserscan".
+  # laserscan only works with 2D configs (Isaac's flat-scan node rejects 3D),
+  # so give each lidar exactly the output it exists for.
+  lidar:
+    - enabled: true
+      name: "lidar"
+      config: "Example_Rotary"       # 3D, +-15 deg elevation -> rich pointcloud
+      outputs: ["pointcloud"]
+      frequency: 10.0
+      position: [0.0, 0.0, 0.10]     # body-frame FLU offset, metres
+      orientation: [0.0, 0.0, 0.0]   # ZYX euler, degrees
+    - enabled: false
+      name: "lidar2d"
+      config: "Example_Rotary_2D"    # single plane -> laserscan for 2D SLAM etc.
+      outputs: ["laserscan"]
+      frequency: 10.0
+      position: [0.0, 0.0, 0.15]
+      orientation: [0.0, 0.0, 0.0]
+
+  # --- On-board FPV camera (drone POV) ----------------------------------------
+  # Creates a camera prim on the drone body: pick "<name>" in the viewport camera
+  # dropdown for the drone-POV view. Published to ROS 2 as:
+  #   /<ns><id>/<name>/color/image_raw  (+ /color/camera_info; /depth if depth: true)
+  # One mapping or a list, like lidar.
+  camera:
+    enabled: true
+    name: "camera"
+    resolution: [1280, 720]
+    frequency: 20.0
+    depth: false                     # true also publishes a depth image (costs GPU)
+    position: [0.30, 0.0, 0.0]       # body-frame FLU: 30 cm forward of CG
+    orientation: [0.0, 0.0, 180.0]   # ZYX euler deg (Pegasus default = forward, upright)
 
 # --- Chase (follow) camera ---------------------------------------------------
 # Script-driven third-person camera that tracks the vehicle every frame.
@@ -80,7 +121,7 @@ static_cameras:
     set_perspective: true     # also park the editor Perspective camera here
   - name: aisle_cam           # north end of the west flight aisle, head-on at the drone
     position: [-5.4, 6.5, 2.4]
-    look_at: [-5.3, -1.0, 0.5]
+    look_at: [-5.3, -1.5, 0.5]
     focal_length: 18
   - name: top_cam             # bird's-eye map view over the room centre (north = up)
     position: [-2.7, 1.3, 3.5]
@@ -119,6 +160,10 @@ backend:
 # Launched as a child process; killed on app exit.
 uxrce_dds:
   enabled: true
+  # Namespace for PX4's /fmu topics. null = auto: <backend.ros2.namespace><vehicle_id>
+  # (same namespace as the Pegasus sensor topics, e.g. /drone1/fmu/out/...).
+  # "" disables namespacing (plain /fmu/..., or /px4_N/fmu/... for instance N>0).
+  namespace: null
   autostart_agent: true       # spawn MicroXRCEDDSAgent as a child process
   transport: "udp"            # "udp" (sim / PX4 SITL) | "serial" (hardware / Jetson UART)
   udp_port: 8888              # PX4 SITL uxrce_dds_client default; used when transport: udp
@@ -129,6 +174,20 @@ uxrce_dds:
   command: null
 
 # --- RViz (external ROS 2 process) -------------------------------------------
+# Runs with the HOST ROS 2 (auto-detected /opt/ros/*/setup.bash), not Isaac's.
 rviz:
-  enabled: false
-  config: null               # optional path to a .rviz file (rviz2 -d <config>)
+  enabled: true
+  config: "/home/ubuntu/isaacsim/rviz_lidar.rviz"   # preset: lidar point cloud view
+  ros_setup: null            # e.g. /opt/ros/humble/setup.bash; null = auto-detect
+  # Drone pose -> TF bridge (host, pose_to_tf.py): mirrors the PoseStamped topic
+  # as TF frame "drone_base_link", anchoring the drone to the world "map" frame.
+  # NOTE: topic namespaces follow <backend.ros2.namespace><vehicle_id> ("drone1").
+  pose_tfs:
+    - topic: "/drone1/state/pose"
+      child_frame: "drone_base_link"
+  # Host static_transform_publishers ("x y z yaw pitch roll parent child"):
+  # sensor mount frames hanging off the drone body (match vehicle sensor offsets).
+  static_tfs:
+    - "0 0 0.10 0 0 0 drone_base_link lidar"
+    - "0 0 0.15 0 0 0 drone_base_link lidar2d"
+    - "0.30 0 0 0 0 0 drone_base_link camera"

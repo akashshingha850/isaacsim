@@ -12,6 +12,7 @@
 
 import os
 import sys
+import glob
 import argparse
 import subprocess
 
@@ -129,8 +130,22 @@ class Launcher:
 
         # --- Build the vehicle + backend ------------------------------------
         vehicle_cfg = cfg.get("vehicle", {})
+
+        # Namespace PX4's uXRCE-DDS topics under the same per-vehicle namespace as
+        # the Pegasus sensor topics (/droneN/fmu/... instead of /fmu/...). PX4
+        # SITL's rcS reads PX4_UXRCE_DDS_NS when starting its uxrce_dds_client;
+        # PX4 is autolaunched from this process, so the env var is inherited.
+        uxrce_ns = cfg.get("uxrce_dds", {}).get("namespace")
+        if uxrce_ns is None:
+            r = cfg.get("backend", {}).get("ros2", {})
+            uxrce_ns = r.get("namespace", "drone") + str(int(vehicle_cfg.get("vehicle_id", 0)))
+        if uxrce_ns:
+            os.environ["PX4_UXRCE_DDS_NS"] = str(uxrce_ns)
+            print(f"[launch] PX4 uXRCE-DDS topics namespaced under /{uxrce_ns}/fmu/...")
+
         config_multirotor = MultirotorConfig()
         config_multirotor.backends = self._build_backends(cfg.get("backend", {}), vehicle_cfg)
+        config_multirotor.graphical_sensors = self._build_graphical_sensors(vehicle_cfg)
 
         vehicle_usd = _resolve_vehicle_usd(vehicle_cfg)
         pos = vehicle_cfg.get("position", [0.0, 0.0, 0.15])
@@ -307,16 +322,15 @@ class Launcher:
     def _build_backends(self, backend_cfg, vehicle_cfg):
         btype = str(backend_cfg.get("type", "px4")).lower()
         vehicle_id = int(vehicle_cfg.get("vehicle_id", 0))
+        r = backend_cfg.get("ros2", {})
 
         if btype == "none":
             print("[launch] Backend: none (no autopilot / ROS control)")
-            return []
-
-        if btype == "ros2":
+            backends = []
+        elif btype == "ros2":
             from pegasus.simulator.logic.backends.ros2_backend import ROS2Backend
-            r = backend_cfg.get("ros2", {})
             print("[launch] Backend: ROS2Backend")
-            return [ROS2Backend(vehicle_id=vehicle_id, config={
+            backends = [ROS2Backend(vehicle_id=vehicle_id, config={
                 "namespace": r.get("namespace", "drone"),
                 "pub_sensors": r.get("pub_sensors", True),
                 "pub_graphical_sensors": r.get("pub_graphical_sensors", True),
@@ -324,18 +338,93 @@ class Launcher:
                 "pub_tf": r.get("pub_tf", False),
                 "sub_control": r.get("sub_control", False),
             })]
+        else:  # default: PX4 MAVLink
+            p = backend_cfg.get("px4", {})
+            mavlink_config = PX4MavlinkBackendConfig({
+                "vehicle_id": vehicle_id,
+                "px4_autolaunch": bool(p.get("autolaunch", True)),
+                "px4_dir": p.get("px4_dir") or self.pg.px4_path,
+                "px4_vehicle_model": p.get("airframe") or self.pg.px4_default_airframe,
+                "enable_lockstep": bool(p.get("enable_lockstep", True)),
+            })
+            print("[launch] Backend: PX4MavlinkBackend")
+            backends = [PX4MavlinkBackend(mavlink_config)]
 
-        # default: PX4 MAVLink
-        p = backend_cfg.get("px4", {})
-        mavlink_config = PX4MavlinkBackendConfig({
-            "vehicle_id": vehicle_id,
-            "px4_autolaunch": bool(p.get("autolaunch", True)),
-            "px4_dir": p.get("px4_dir") or self.pg.px4_path,
-            "px4_vehicle_model": p.get("airframe") or self.pg.px4_default_airframe,
-            "enable_lockstep": bool(p.get("enable_lockstep", True)),
-        })
-        print("[launch] Backend: PX4MavlinkBackend")
-        return [PX4MavlinkBackend(mavlink_config)]
+        # Graphical sensors (lidar) publish through a ROS2Backend. When the flight
+        # backend isn't ROS2, add a publish-only ROS2Backend alongside it (same
+        # pattern as example 8_camera_vehicle.py).
+        graphical = []
+        for key in ("lidar", "camera"):
+            v = vehicle_cfg.get(key, [])
+            graphical += [v] if isinstance(v, dict) else list(v)
+        if btype != "ros2" and any(s.get("enabled", False) for s in graphical):
+            from pegasus.simulator.logic.backends.ros2_backend import ROS2Backend
+            backends.append(ROS2Backend(vehicle_id=vehicle_id, config={
+                "namespace": r.get("namespace", "drone"),
+                "pub_sensors": False,
+                "pub_graphical_sensors": True,
+                "pub_state": r.get("pub_state", True),
+                "pub_tf": r.get("pub_tf", False),
+                "sub_control": False,
+            }))
+            print("[launch] ROS2Backend added alongside the flight backend (sensor publishing)")
+        return backends
+
+    def _build_graphical_sensors(self, vehicle_cfg):
+        """Graphical sensors attached to the vehicle: lidars (a single mapping or a list)."""
+        lidars = vehicle_cfg.get("lidar", [])
+        if isinstance(lidars, dict):
+            lidars = [lidars]
+        sensors = []
+        for l in lidars:
+            if not l.get("enabled", False):
+                continue
+            from pegasus.simulator.logic.graphical_sensors.lidar import Lidar
+
+            class _LidarWithOutputs(Lidar):
+                """Lidar that tells the ROS2 backend which writers to create
+                (a 3D lidar can't produce a LaserScan, so don't ask for one)."""
+                def __init__(self, name, config, ros_outputs):
+                    super().__init__(name, config)
+                    self._ros_outputs = ros_outputs
+
+                def update(self, state, dt):
+                    data = super().update(state, dt)
+                    if data is not None:
+                        data["outputs"] = self._ros_outputs
+                    return data
+
+            name = l.get("name", "lidar")
+            rtx_config = l.get("config", "Example_Rotary")
+            outputs = [str(o).lower() for o in l.get("outputs", ["pointcloud", "laserscan"])]
+            sensors.append(_LidarWithOutputs(name, config={
+                # upstream Lidar indexes ["sensor_configuration"] on this value,
+                # so the RTX config name must be nested one level deep
+                "sensor_configuration": {"sensor_configuration": rtx_config},
+                "position": np.array(l.get("position", [0.0, 0.0, 0.10]), dtype=float),
+                "orientation": np.array(l.get("orientation", [0.0, 0.0, 0.0]), dtype=float),
+                "frequency": float(l.get("frequency", 60.0)),
+            }, ros_outputs=outputs))
+            print(f"[launch] Lidar '{name}' (RTX config '{rtx_config}', outputs={outputs}) on the vehicle body")
+
+        cameras = vehicle_cfg.get("camera", [])
+        if isinstance(cameras, dict):
+            cameras = [cameras]
+        for c in cameras:
+            if not c.get("enabled", False):
+                continue
+            from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
+            name = c.get("name", "camera")
+            res = tuple(c.get("resolution", [1280, 720]))
+            sensors.append(MonocularCamera(name, config={
+                "depth": bool(c.get("depth", False)),
+                "position": np.array(c.get("position", [0.30, 0.0, 0.0]), dtype=float),
+                "orientation": np.array(c.get("orientation", [0.0, 0.0, 180.0]), dtype=float),
+                "resolution": res,
+                "frequency": float(c.get("frequency", 30.0)),
+            }))
+            print(f"[launch] Camera '{name}' ({res[0]}x{res[1]}) on the vehicle body")
+        return sensors
 
     # ------------------------------------------------------- external processes
     def _spawn(self, argv, name, env=None):
@@ -383,13 +472,42 @@ class Launcher:
             env["LD_LIBRARY_PATH"] = ""
         self._spawn(argv, "Micro XRCE-DDS Agent", env=env)
 
+    def _spawn_host_ros(self, cmd, name, rviz_cfg):
+        """Spawn a command under the HOST ROS 2 env, not Isaac's (isaac_run unsets
+        the ROS vars and injects Isaac's own libs): source the ROS setup script in
+        a clean shell and strip Isaac's library paths from the child env."""
+        setup = rviz_cfg.get("ros_setup")
+        if not setup:
+            candidates = sorted(glob.glob("/opt/ros/*/setup.bash"))
+            setup = candidates[0] if candidates else None
+        if setup:
+            argv = ["bash", "-c", f"source {setup} && exec {cmd}"]
+        else:
+            carb.log_warn(f"[launch] No /opt/ros/*/setup.bash found; launching {name} with the current env")
+            argv = cmd.split()
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = ""
+        env["PYTHONPATH"] = ""
+        self._spawn(argv, name, env=env)
+
     def _start_rviz(self, rviz_cfg):
+        # Static TFs linking sensor frames (e.g. drone_base_link -> lidar), so RViz
+        # can display several sensors under one fixed frame. Runs on the host ROS 2.
+        for spec in rviz_cfg.get("static_tfs") or []:
+            self._spawn_host_ros(f"ros2 run tf2_ros static_transform_publisher {spec}",
+                                 f"static_tf [{spec}]", rviz_cfg)
+        # Pose -> TF bridges: mirror a PoseStamped topic as a TF frame, so the
+        # moving vehicle is anchored to the world frame in RViz.
+        for spec in rviz_cfg.get("pose_tfs") or []:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_to_tf.py")
+            self._spawn_host_ros(f"python3 {script} {spec['topic']} {spec['child_frame']}",
+                                 f"pose_to_tf [{spec['child_frame']}]", rviz_cfg)
         if not rviz_cfg.get("enabled", False):
             return
-        argv = ["rviz2"]
+        cmd = "rviz2"
         if rviz_cfg.get("config"):
-            argv += ["-d", rviz_cfg["config"]]
-        self._spawn(argv, "RViz")
+            cmd += " -d '" + str(rviz_cfg["config"]) + "'"
+        self._spawn_host_ros(cmd, "RViz", rviz_cfg)
 
     # -------------------------------------------------------------------- loop
     def run(self):
