@@ -145,8 +145,9 @@ class Launcher:
             config=config_multirotor,
         )
 
-        # --- Chase (follow) camera -------------------------------------------
+        # --- Cameras ---------------------------------------------------------
         self._setup_chase_camera(cfg.get("chase_camera", {}))
+        self._setup_static_cameras(cfg.get("static_cameras", []))
 
         # --- Optional external ROS 2 processes ------------------------------
         self._start_rviz(cfg.get("rviz", {}))
@@ -187,11 +188,15 @@ class Launcher:
         self.chase_camera_yaw_follow = bool(chase_cfg.get("yaw_follow", True))
         self.chase_camera_follow_selection = bool(chase_cfg.get("follow_selection", True))
         self.chase_camera_smoothing = min(max(float(chase_cfg.get("smoothing", 0.15)), 0.0), 0.95)
+        self.chase_camera_z_min = chase_cfg.get("z_min")
+        self.chase_camera_z_max = chase_cfg.get("z_max")
         self._chase_eye = None
         self._chase_target = None
         self._chase_viewport = None
         self._chase_last_target = None
-        UsdGeom.Camera.Define(self.world.stage, self.chase_camera_path)
+        cam = UsdGeom.Camera.Define(self.world.stage, self.chase_camera_path)
+        if chase_cfg.get("focal_length"):
+            cam.CreateFocalLengthAttr(float(chase_cfg["focal_length"]))
         print(f"[launch] Chase camera at {self.chase_camera_path} "
               f"(offset={self.chase_camera_offset.tolist()}, yaw_follow={self.chase_camera_yaw_follow}, "
               f"follow_selection={self.chase_camera_follow_selection})")
@@ -204,12 +209,15 @@ class Launcher:
                 print("[launch] Viewport switched to the chase camera "
                       "(pick 'Perspective' in the viewport camera dropdown for free mouse control)")
 
-    def _aim_chase_camera(self, eye, target):
-        """Place the chase-camera prim at `eye` looking at `target` (world frame, +Z up)."""
+    def _aim_camera(self, cam_path, eye, target):
+        """Place a camera prim at `eye` looking at `target` (world frame, +Z up)."""
         eye = Gf.Vec3d(float(eye[0]), float(eye[1]), float(eye[2]))
         target = Gf.Vec3d(float(target[0]), float(target[1]), float(target[2]))
         f = (target - eye).GetNormalized()              # forward (camera looks down -Z)
-        r = Gf.Cross(f, Gf.Vec3d(0, 0, 1)).GetNormalized()  # right
+        up_ref = Gf.Vec3d(0, 0, 1)
+        if abs(Gf.Dot(f, up_ref)) > 0.999:              # straight up/down view: keep +Y ("north") up
+            up_ref = Gf.Vec3d(0, 1, 0)
+        r = Gf.Cross(f, up_ref).GetNormalized()         # right
         u = Gf.Cross(r, f)                              # up
         # Row-vector transform: rows are the world directions of camera local X, Y, Z.
         m = Gf.Matrix4d(
@@ -218,9 +226,25 @@ class Launcher:
             -f[0], -f[1], -f[2], 0.0,
             eye[0], eye[1], eye[2], 1.0,
         )
-        cam = UsdGeom.Xformable(self.world.stage.GetPrimAtPath(self.chase_camera_path))
+        cam = UsdGeom.Xformable(self.world.stage.GetPrimAtPath(cam_path))
         cam.ClearXformOpOrder()
         cam.AddTransformOp().Set(m)
+
+    def _setup_static_cameras(self, cams_cfg):
+        """Fixed viewpoint cameras, selectable from the viewport camera dropdown."""
+        for c in cams_cfg or []:
+            path = "/World/" + c.get("name", "static_camera")
+            cam = UsdGeom.Camera.Define(self.world.stage, path)
+            if c.get("focal_length"):
+                cam.CreateFocalLengthAttr(float(c["focal_length"]))
+            eye = c.get("position", [0.0, 0.0, 2.0])
+            target = c.get("look_at", [0.0, 0.0, 0.0])
+            self._aim_camera(path, eye, target)
+            print(f"[launch] Static camera {path}: {eye} -> {target}")
+            # Optionally park the editor Perspective camera at the same pose, so
+            # switching the viewport to Perspective starts from a sensible view.
+            if c.get("set_perspective", False) and not bool(self.cfg.get("app", {}).get("headless", False)):
+                self.pg.set_viewport_camera(eye, target)
 
     def _selected_prim_pose(self):
         """World position + yaw of the first prim selected in the GUI, or (None, None)
@@ -261,6 +285,12 @@ class Launcher:
         else:
             world_offset = self.chase_camera_offset
         eye = target_pos + world_offset
+        # Keep the camera inside the building: clamp height (e.g. under the ceiling)
+        # even when the target flies high.
+        if self.chase_camera_z_max is not None:
+            eye[2] = min(eye[2], float(self.chase_camera_z_max))
+        if self.chase_camera_z_min is not None:
+            eye[2] = max(eye[2], float(self.chase_camera_z_min))
 
         if self._chase_eye is None or self.chase_camera_smoothing <= 0.0:
             self._chase_eye, self._chase_target = eye, target_pos
@@ -271,7 +301,7 @@ class Launcher:
 
         if np.linalg.norm(self._chase_target - self._chase_eye) < 1e-6:
             return  # degenerate look-at (eye on top of target)
-        self._aim_chase_camera(self._chase_eye, self._chase_target)
+        self._aim_camera(self.chase_camera_path, self._chase_eye, self._chase_target)
 
     # ---------------------------------------------------------------- backend
     def _build_backends(self, backend_cfg, vehicle_cfg):

@@ -15,7 +15,10 @@ world:
   usd_path: null
   # One of the keys in pegasus.simulator.params.SIMULATION_ENVIRONMENTS
   # (e.g. "Curved Gridroom", "Flat Plane", "Warehouse", "Rusko Summer", ...).
-  preset: "Curved Gridroom"
+  # Indoor: "Small Warehouse" (garage-like digital twin), "Simple Room", "Office",
+  # "Hospital", "Warehouse" / "... with Forklifts/Shelves" / "Full Warehouse",
+  # "Exhibition Hall".
+  preset: "Small Warehouse"
   # Add a flat invisible ground collider at z=ground_z. Needed for render-only
   # worlds (e.g. NuRec volumes) that ship no collision mesh. false for normal USDs.
   add_ground_plane: false
@@ -29,8 +32,11 @@ vehicle:
   preset: "Iris"
   stage_prefix: "/World/quadrotor"
   vehicle_id: 0
-  position: [0.0, 0.0, 0.15]          # ENU, metres
-  orientation_euler_deg: [0.0, 0.0, 0.0]   # roll, pitch, yaw (XYZ)
+  # Small Warehouse: room interior is x[-6.7,1.3] y[-7.2,9.8], ceiling 3.7 m.
+  # (-5.3,-1) is the clear WEST aisle (shelving/boxes start at x=-4.6);
+  # yaw 90 faces north along the aisle toward the open north zone.
+  position: [-5.3, -1.0, 0.15]        # ENU, metres
+  orientation_euler_deg: [0.0, 0.0, 90.0]  # roll, pitch, yaw (XYZ)
 
 # --- Chase (follow) camera ---------------------------------------------------
 # Script-driven third-person camera that tracks the vehicle every frame.
@@ -41,7 +47,13 @@ vehicle:
 chase_camera:
   enabled: true
   stage_path: "/World/chase_camera"
-  offset: [-10.0, 0.0, 3.0]   # body-frame FLU, metres: behind (-X) and above (+Z)
+  offset: [-3.0, 0.0, 1.2]   # body-frame FLU, metres: behind (-X) and above (+Z).
+                             # Indoors keep |offset| under the nearest wall distance
+                             # (z_max below handles the ceiling). ~[-10,0,3] outdoors.
+  focal_length: 21           # mm; smaller = wider FOV (USD default 50 is narrow indoors)
+  z_min: 0.3                 # camera height clamps (metres, world Z). Keeps the chase
+  z_max: 3.35                # camera under the 3.7 m ceiling / off the floor no matter
+                             # how high or low the drone flies. null = no clamp.
   yaw_follow: true           # true = offset rotates with drone yaw (stays behind);
                              # false = fixed world-frame offset (Gazebo-classic style)
   set_active: true           # switch the viewport to this camera at startup;
@@ -53,6 +65,27 @@ chase_camera:
                              # to deselect -> falls back to following the drone.
   smoothing: 0.15            # 0 = snap instantly; 0..0.95 = exponential glide per
                              # frame (softens the jump when re-targeting objects)
+
+# --- Static viewpoint cameras --------------------------------------------------
+# Fixed cameras created at startup; pick them from the viewport camera dropdown.
+# position / look_at are world ENU metres; focal_length in mm (smaller = wider).
+# Positions below are fitted to the Small Warehouse room:
+#   interior x[-6.7,1.3] y[-7.2,9.8], ceiling 3.7 m, light bars at z=3.0,
+#   shelving x[-4.6,1.2], clear west aisle at x=-5.3, open north zone y>5.5.
+static_cameras:
+  - name: overview_cam        # high SE corner: whole room diagonally (racks, aisle, office)
+    position: [0.9, -6.8, 3.3]
+    look_at: [-2.9, 1.5, 0.6]
+    focal_length: 15
+    set_perspective: true     # also park the editor Perspective camera here
+  - name: aisle_cam           # north end of the west flight aisle, head-on at the drone
+    position: [-5.4, 6.5, 2.4]
+    look_at: [-5.3, -1.0, 0.5]
+    focal_length: 18
+  - name: top_cam             # bird's-eye map view over the room centre (north = up)
+    position: [-2.7, 1.3, 3.5]
+    look_at: [-2.7, 1.3, 0.0]
+    focal_length: 14
 
 # --- Control backend ---------------------------------------------------------
 # NOTE: backend "px4" = PX4MavlinkBackend = the sim-internal MAVLink link that
